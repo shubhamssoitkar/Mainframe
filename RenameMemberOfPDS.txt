@@ -1,0 +1,148 @@
+import java.io.*;
+import java.util.logging.*;
+
+/**
+ * Program to copy members from one PDS to another using IEBCOPY.
+ * - Allocates target PDS using IEFBR14
+ * - Lists source members
+ * - Copies members starting with "MD" to target with renamed prefix "RD"
+ * - Verifies copied members
+ */
+public class PdsMemberCopy {
+
+    private static final Logger logger = Logger.getLogger(PdsMemberCopy.class.getName());
+
+    private static final String SOURCE_PDS = "Z10791.COPY.TEST1";
+    private static final String TARGET_PDS = "Z10791.COPY.TEST2";
+    private static final String VOLSER = "DEV001"; // Replace with actual DASD volser
+
+    public static void main(String[] args) {
+        try {
+            configureLogger();
+
+            allocateTargetPds();
+            StringBuilder copyJcl = buildCopyJcl();
+            submitCopyJob(copyJcl);
+            verifyTargetMembers();
+
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Unexpected error occurred", e);
+        }
+    }
+
+    /**
+     * Configure logger with console handler and simple format.
+     */
+    private static void configureLogger() {
+        Logger rootLogger = Logger.getLogger("");
+        Handler consoleHandler = new ConsoleHandler();
+        consoleHandler.setLevel(Level.ALL);
+        consoleHandler.setFormatter(new SimpleFormatter());
+        rootLogger.addHandler(consoleHandler);
+        rootLogger.setLevel(Level.ALL);
+    }
+
+    /**
+     * Step 1: Allocate target PDS using IEFBR14 and LIKE(sourcePds).
+     */
+    private static void allocateTargetPds() throws IOException, InterruptedException {
+        logger.info("Allocating target PDS: " + TARGET_PDS);
+
+        String allocJcl =
+            "//ALLOC   JOB (ACCT),'ALLOC PDS',CLASS=A,MSGCLASS=X,REGION=0M\n" +
+            "//STEP1   EXEC PGM=IEFBR14\n" +
+            "//NEWPDS  DD  DSN=" + TARGET_PDS + ",\n" +
+            "//            DISP=(NEW,CATLG,DELETE),\n" +
+            "//            LIKE=" + SOURCE_PDS + ",\n" +
+            "//            VOL=SER=" + VOLSER + "\n" +
+            "/*\n";
+
+        Process allocSubmit = new ProcessBuilder("submit").start();
+        try (OutputStream os = allocSubmit.getOutputStream()) {
+            os.write(allocJcl.getBytes());
+        }
+        int rc = allocSubmit.waitFor();
+
+        if (rc == 0) {
+            logger.info("Target PDS allocated successfully.");
+        } else {
+            logger.warning("Target PDS allocation failed. RC=" + rc);
+        }
+    }
+
+    /**
+     * Step 2 & 3: List source members and build IEBCOPY JCL.
+     */
+    private static StringBuilder buildCopyJcl() throws IOException, InterruptedException {
+        logger.info("Listing source members from: " + SOURCE_PDS);
+
+        Process listProc = new ProcessBuilder("tsocmd", "LISTDS '" + SOURCE_PDS + "' MEMBERS").start();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(listProc.getInputStream()));
+
+        StringBuilder copyJcl = new StringBuilder();
+        copyJcl.append("//COPYJOB JOB (ACCT),'COPY MD MEMBERS',CLASS=A,MSGCLASS=X,REGION=0M\n")
+               .append("//STEP1   EXEC PGM=IEBCOPY\n")
+               .append("//SYSPRINT DD SYSOUT=*\n")
+               .append("//SYSUT1   DD DISP=SHR,DSN=").append(SOURCE_PDS).append("\n")
+               .append("//SYSUT2   DD DISP=SHR,DSN=").append(TARGET_PDS).append("\n")
+               .append("//SYSIN    DD *\n")
+               .append("  COPY INDD=SYSUT1,OUTDD=SYSUT2\n");
+
+        int copiedCount = 0;
+        String member;
+        while ((member = reader.readLine()) != null) {
+            member = member.trim();
+            if (member.matches("^[A-Z0-9]{1,8}$") && member.startsWith("MD")) {
+                String newName = member.replaceFirst("MD", "RD");
+                logger.info("Preparing copy: " + member + " -> " + newName);
+
+                copyJcl.append("    SELECT MEMBER=((")
+                       .append(member)
+                       .append(",")
+                       .append(newName)
+                       .append("))\n");
+                copiedCount++;
+            }
+        }
+        copyJcl.append("/*\n");
+        listProc.waitFor();
+
+        logger.info("Total members prepared for copy: " + copiedCount);
+        return copyJcl;
+    }
+
+    /**
+     * Step 4: Submit IEBCOPY JCL to copy members.
+     */
+    private static void submitCopyJob(StringBuilder copyJcl) throws IOException, InterruptedException {
+        logger.info("Submitting IEBCOPY job...");
+
+        Process copySubmit = new ProcessBuilder("submit").start();
+        try (OutputStream os = copySubmit.getOutputStream()) {
+            os.write(copyJcl.toString().getBytes());
+        }
+        int rc = copySubmit.waitFor();
+
+        if (rc == 0) {
+            logger.info("Copy job submitted successfully.");
+        } else {
+            logger.severe("Copy job failed. RC=" + rc);
+        }
+    }
+
+    /**
+     * Step 5: Verify destination members.
+     */
+    private static void verifyTargetMembers() throws IOException, InterruptedException {
+        logger.info("Verifying members in target PDS: " + TARGET_PDS);
+
+        Process verifyCopy = new ProcessBuilder("tsocmd", "LISTDS '" + TARGET_PDS + "' MEMBERS").start();
+        BufferedReader copyReader = new BufferedReader(new InputStreamReader(verifyCopy.getInputStream()));
+        String line;
+
+        while ((line = copyReader.readLine()) != null) {
+            logger.info("Target member: " + line.trim());
+        }
+        verifyCopy.waitFor();
+    }
+}
