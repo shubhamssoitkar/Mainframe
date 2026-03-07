@@ -1,0 +1,86 @@
+import java.io.*;
+
+class prog2 {
+    public static void main(String[] args) {
+        String sourcePds = "Z10791.COPY.TEST1";
+        String targetPds = "Z10791.COPY.TEST2";
+
+        try {
+            // Step 1: Allocate target PDS using IEFBR14 and LIKE(sourcePds)
+            String allocJcl =
+                "//ALLOC   JOB (ACCT),'ALLOC PDS',CLASS=A,MSGCLASS=X,REGION=0M\n" +
+                "//STEP1   EXEC PGM=IEFBR14\n" +
+                "//NEWPDS  DD  DSN=" + targetPds + ",\n" +
+                "//            DISP=(NEW,CATLG,DELETE),\n" +
+                "//            LIKE=" + sourcePds + ",\n" +
+                "//            VOL=SER=DEV001\n" +   // replace DEV001 with your actual DASD volser
+                "/*\n";
+
+            Process allocSubmit = new ProcessBuilder("submit").start();
+            try (OutputStream os = allocSubmit.getOutputStream()) {
+                os.write(allocJcl.getBytes());
+            }
+            allocSubmit.waitFor();
+
+            // Step 2: List source members
+            Process listProc = new ProcessBuilder("tsocmd", "LISTDS '" + sourcePds + "' MEMBERS").start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(listProc.getInputStream()));
+
+            // Step 3: Build IEBCOPY JCL
+            StringBuilder copyJcl = new StringBuilder();
+            copyJcl.append("//COPYJOB JOB (ACCT),'COPY MD MEMBERS',CLASS=A,MSGCLASS=X,REGION=0M\n")
+                   .append("//STEP1   EXEC PGM=IEBCOPY\n")
+                   .append("//SYSPRINT DD SYSOUT=*\n")
+                   .append("//SYSUT1   DD DISP=SHR,DSN=").append(sourcePds).append("\n")
+                   .append("//SYSUT2   DD DISP=SHR,DSN=").append(targetPds).append("\n")
+                   .append("//SYSIN    DD *\n")
+                   .append("  COPY INDD=SYSUT1,OUTDD=SYSUT2\n");
+
+            int copiedCount = 0;
+            String member;
+           while ((member = reader.readLine()) != null) {
+                member = member.trim();
+                if (member.matches("^[A-Z0-9]{1,8}$") && member.startsWith("MD")) {
+                    String newName = member.replaceFirst("MD", "RD");
+                    System.out.println("Copying " + member + " -> " + newName);
+                    // Generate SELECT MEMBER=((old,new)) format
+                    copyJcl.append("    SELECT MEMBER=((")
+                           .append(member)
+                           .append(",")
+                           .append(newName)
+                           .append("))\n");
+                    copiedCount++;
+                }
+            }
+            copyJcl.append("/*\n");
+            listProc.waitFor();
+
+
+            // Step 4: Submit IEBCOPY JCL
+            Process copySubmit = new ProcessBuilder("submit").start();
+            try (OutputStream os = copySubmit.getOutputStream()) {
+                os.write(copyJcl.toString().getBytes());
+            }
+            int rc = copySubmit.waitFor();
+            if (rc == 0) {
+                System.out.println(" Copy job submitted successfully.");
+                System.out.println(" Total members copied: " + copiedCount);
+            } else {
+                System.err.println(" Copy job failed RC=" + rc);
+            }
+
+            // Step 5: Verify destination members
+            Process verifyCopy = new ProcessBuilder("tsocmd", "LISTDS '" + targetPds + "' MEMBERS").start();
+            BufferedReader copyReader = new BufferedReader(new InputStreamReader(verifyCopy.getInputStream()));
+            String line;
+            System.out.println(" Members in target PDS:");
+            while ((line = copyReader.readLine()) != null) {
+                System.out.println("   " + line.trim());
+            }
+            verifyCopy.waitFor();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
